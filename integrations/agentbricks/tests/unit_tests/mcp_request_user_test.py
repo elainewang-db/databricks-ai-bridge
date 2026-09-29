@@ -248,6 +248,84 @@ def test_tool_result_permission_errors_are_not_model_results(adapter, monkeypatc
     assert "secret" not in str(raised.value)
 
 
+def test_langgraph_mcp_failure_logs_safe_cause(adapter, caplog):
+    if not adapter.__name__.endswith("langgraph.mcp"):
+        pytest.skip("LangGraph tool interceptor")
+    from databricks_agentkit.runtime.auth import AuthError
+
+    interceptor = adapter._sandbox_interceptor((tool("user"),))
+    request = SimpleNamespace(server_name="search", name="search", args={})
+    with caplog.at_level("WARNING"), pytest.raises(AuthError) as raised:
+        asyncio.run(interceptor(request, AsyncMock(side_effect=RuntimeError("secret body"))))
+
+    assert "MCP tool search failed" in caplog.text
+    assert "RuntimeError" in caplog.text
+    assert "secret body" not in caplog.text
+    assert raised.value.code == "MCP_TOOL_FAILED"
+    assert raised.value.status_code == 502
+
+
+def test_langgraph_mcp_failure_logs_bounded_nested_http_diagnostic(adapter, caplog):
+    if not adapter.__name__.endswith("langgraph.mcp"):
+        pytest.skip("LangGraph tool interceptor")
+    from databricks_agentkit.runtime.auth import AuthError
+
+    exception_group = getattr(builtins, "ExceptionGroup", None)
+    if exception_group is None:
+        pytest.skip("ExceptionGroup requires Python 3.11 or newer")
+    import httpx
+
+    request = httpx.Request(
+        "GET",
+        "https://workspace.example/mcp?token=url-secret",
+        headers={"Authorization": "Bearer credential-secret"},
+    )
+    response = httpx.Response(403, content=b"response-body-secret", request=request)
+    http_error = httpx.HTTPStatusError(
+        "upstream-message-secret", request=request, response=response
+    )
+    code_error = RuntimeError("code-message-secret")
+    code_error.error = SimpleNamespace(code=-32042)
+    cyclic_error = RuntimeError("cycle-message-secret")
+    cyclic_error.__cause__ = cyclic_error
+    deeply_nested: BaseException = RuntimeError("deep-message-secret")
+    for index in range(20):
+        deeply_nested = exception_group(f"group-message-secret-{index}", [deeply_nested])
+    error = exception_group(
+        "outer-message-secret", [http_error, code_error, cyclic_error, deeply_nested]
+    )
+
+    interceptor = adapter._sandbox_interceptor((tool("user"),))
+    request = SimpleNamespace(server_name="search", name="search", args={})
+    with caplog.at_level("WARNING"), pytest.raises(AuthError) as raised:
+        asyncio.run(interceptor(request, AsyncMock(side_effect=error)))
+
+    record = next(
+        record for record in caplog.records if "MCP tool search failed" in record.getMessage()
+    )
+    assert record.exc_info is None
+    assert "ExceptionGroup" in record.getMessage()
+    assert "HTTPStatusError" in record.getMessage()
+    assert "403" in record.getMessage()
+    assert "-32042" in record.getMessage()
+    assert record.mcp_http_statuses == (403,)
+    assert record.mcp_error_codes == (-32042,)
+    assert len(record.mcp_exception_types) <= adapter._MAX_EXCEPTION_DIAGNOSTIC_NODES
+    assert record.mcp_diagnostic_truncated is True
+    assert raised.value.code == "MCP_PERMISSION_DENIED"
+    assert raised.value.status_code == 403
+    assert raised.value.integration_id == "search"
+    for secret in (
+        "upstream-message-secret",
+        "response-body-secret",
+        "credential-secret",
+        "url-secret",
+        "outer-message-secret",
+        "group-message-secret",
+    ):
+        assert secret not in caplog.text
+
+
 def test_app_tool_result_permission_errors_remain_model_results(adapter, monkeypatch):
     result = SimpleNamespace(
         isError=True,

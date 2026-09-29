@@ -29,6 +29,100 @@ from databricks_agentkit.runtime.workspace import workspace_client, workspace_he
 logger = logging.getLogger(__name__)
 _auth_error = mcp_auth.mcp_auth_error
 _tool_error = mcp_auth.mcp_tool_error
+_MAX_EXCEPTION_DIAGNOSTIC_DEPTH = 5
+_MAX_EXCEPTION_DIAGNOSTIC_NODES = 32
+_KNOWN_MCP_ERROR_CODES = frozenset(
+    {
+        "MCP_AUTHORIZATION_REQUIRED",
+        "MCP_CLIENT_CONFIGURATION_FAILED",
+        "MCP_PERMISSION_DENIED",
+        "MCP_TOOL_FAILED",
+        "MCP_USER_AUTH_CONFIGURATION",
+        "MCP_USER_AUTH_EXPIRED",
+        "MCP_USER_AUTH_REQUIRED",
+        "MCP_USER_AUTHORIZATION_INVALID",
+        "MCP_USER_AUTHORIZATION_MISSING",
+        "MCP_USER_IDENTITY_MISSING",
+        "PERMISSION_DENIED",
+        "UNAUTHENTICATED",
+    }
+)
+_KNOWN_MCP_ERROR_CODE_NUMBERS = frozenset({-32042})
+
+
+def _safe_exception_attribute(value: Any, name: str) -> Any:
+    try:
+        return getattr(value, name, None)
+    except BaseException:
+        return None
+
+
+def _integer_http_status(error: BaseException) -> int | None:
+    response = _safe_exception_attribute(error, "response")
+    for status in (
+        _safe_exception_attribute(error, "status_code"),
+        _safe_exception_attribute(response, "status_code"),
+    ):
+        if isinstance(status, int) and not isinstance(status, bool) and 100 <= status <= 599:
+            return int(status)
+    return None
+
+
+def _known_error_code(error: BaseException) -> str | int | None:
+    nested_error = _safe_exception_attribute(error, "error")
+    for value in (
+        _safe_exception_attribute(error, "code"),
+        _safe_exception_attribute(error, "error_code"),
+        _safe_exception_attribute(nested_error, "code"),
+        _safe_exception_attribute(nested_error, "error_code"),
+    ):
+        if isinstance(value, int) and not isinstance(value, bool):
+            if value in _KNOWN_MCP_ERROR_CODE_NUMBERS:
+                return int(value)
+        elif isinstance(value, str) and value in _KNOWN_MCP_ERROR_CODES:
+            return value
+    return None
+
+
+def _safe_exception_diagnostic(
+    error: BaseException,
+) -> tuple[tuple[str, ...], tuple[int, ...], tuple[str | int, ...], bool]:
+    exception_types: list[str] = []
+    http_statuses: list[int] = []
+    error_codes: list[str | int] = []
+    seen: set[int] = set()
+    truncated = False
+
+    def visit(candidate: BaseException, depth: int) -> None:
+        nonlocal truncated
+        candidate_id = id(candidate)
+        if candidate_id in seen:
+            return
+        if depth > _MAX_EXCEPTION_DIAGNOSTIC_DEPTH or len(seen) >= _MAX_EXCEPTION_DIAGNOSTIC_NODES:
+            truncated = True
+            return
+        seen.add(candidate_id)
+        exception_types.append(type(candidate).__name__)
+
+        status = _integer_http_status(candidate)
+        if status is not None and status not in http_statuses:
+            http_statuses.append(status)
+        code = _known_error_code(candidate)
+        if code is not None and code not in error_codes:
+            error_codes.append(code)
+
+        children = _safe_exception_attribute(candidate, "exceptions")
+        if isinstance(children, tuple):
+            for child in children:
+                if isinstance(child, BaseException):
+                    visit(child, depth + 1)
+        for relationship in ("__cause__", "__context__"):
+            child = _safe_exception_attribute(candidate, relationship)
+            if isinstance(child, BaseException):
+                visit(child, depth + 1)
+
+    visit(error, 0)
+    return tuple(exception_types), tuple(http_statuses), tuple(error_codes), truncated
 
 
 def _server_from_tool(
@@ -112,6 +206,24 @@ def _sandbox_interceptor(
                 result = await handler(request)
         except Exception as error:
             if request_user:
+                exception_types, http_statuses, error_codes, diagnostic_truncated = (
+                    _safe_exception_diagnostic(error)
+                )
+                logger.warning(
+                    "MCP tool %s failed: exception_types=%s http_statuses=%s "
+                    "error_codes=%s diagnostic_truncated=%s",
+                    tool.id,
+                    exception_types,
+                    http_statuses,
+                    error_codes,
+                    diagnostic_truncated,
+                    extra={
+                        "mcp_exception_types": exception_types,
+                        "mcp_http_statuses": http_statuses,
+                        "mcp_error_codes": error_codes,
+                        "mcp_diagnostic_truncated": diagnostic_truncated,
+                    },
+                )
                 raise _auth_error(error, tool.id) or AuthError(
                     "MCP_TOOL_FAILED", "The configured MCP tool failed.", 502, tool.id
                 ) from None
